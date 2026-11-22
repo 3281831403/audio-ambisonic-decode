@@ -11,10 +11,6 @@ Conventions used by every function in this module:
   for a unit direction ``(x, y, z)``.
 * Numerical assertions in the acceptance suite use an absolute tolerance of
   ``1e-9``.
-
-The eight public functions are deliberate stubs in the initial state.  Each
-raises :class:`NotImplementedError`; replace the bodies with an implementation
-that satisfies the docstring contract.
 """
 
 from __future__ import annotations
@@ -31,6 +27,8 @@ __all__ = [
     "validate_basis",
     "decode_batch",
 ]
+
+_TOL = 1e-9
 
 
 def sh_basis(order: int, azimuth: float, elevation: float) -> list[float]:
@@ -57,7 +55,18 @@ def sh_basis(order: int, azimuth: float, elevation: float) -> list[float]:
     ``order`` must be 0 (return ``[W]``) or 1 (return ``[W, Y, Z, X]``).
     Components must match the formulas above to within ``1e-9``.
     """
-    raise NotImplementedError("sh_basis is not implemented")
+    if order == 0:
+        return [1.0]
+    if order != 1:
+        raise ValueError("order must be 0 or 1")
+
+    horizontal = math.cos(elevation)
+    x = horizontal * math.cos(azimuth)
+    # Y tracks the azimuth (left/right); Z tracks the elevation (up/down).
+    y = horizontal * math.sin(azimuth)
+    z = math.sin(elevation)
+
+    return [1.0, math.sqrt(3.0) * y, math.sqrt(3.0) * z, math.sqrt(3.0) * x]
 
 
 def to_sn3d(ambi: list[float]) -> list[float]:
@@ -71,7 +80,15 @@ def to_sn3d(ambi: list[float]) -> list[float]:
     Return a new list; do not mutate the input.  Results must agree to within
     ``1e-9``.
     """
-    raise NotImplementedError("to_sn3d is not implemented")
+    result = list(ambi)
+    if len(result) == 1:
+        # Degree 0 only: W is the omnidirectional reference and stays as is.
+        return result
+    # Degree 0 is untouched; every degree-1 channel is divided by sqrt(3).
+    inv_sqrt3 = 1.0 / math.sqrt(3.0)
+    for channel in range(1, len(result)):
+        result[channel] *= inv_sqrt3
+    return result
 
 
 def decode_matrix(
@@ -100,7 +117,34 @@ def decode_matrix(
 
     ``order`` must be 0 or 1.  Matrix entries must be accurate to ``1e-9``.
     """
-    raise NotImplementedError("decode_matrix is not implemented")
+    if n_speakers != len(layout):
+        raise ValueError("n_speakers must equal len(layout)")
+    if order not in (0, 1):
+        raise ValueError("order must be 0 or 1")
+    n_channels = (order + 1) ** 2
+    if n_speakers < n_channels:
+        raise ValueError(
+            "layout must provide at least (order + 1) ** 2 speakers"
+        )
+
+    if order == 0:
+        weights = [1.0]
+    else:
+        first_order_weight = 1.0 / math.sqrt(3.0)
+        weights = [1.0, first_order_weight, first_order_weight, first_order_weight]
+
+    # Rows are speakers, columns are sound-field channels: this orientation is
+    # sound-field -> speakers.  Transposing would encode instead of decoding.
+    matrix: list[list[float]] = []
+    for azimuth, elevation in layout:
+        basis = sh_basis(order, azimuth, elevation)
+        # D0 = Y / N.  The common 1/N factor is removed by the row
+        # normalisation below, but it is kept explicit for clarity.
+        raw = [basis[channel] / n_speakers for channel in range(n_channels)]
+        weighted = [raw[channel] * weights[channel] for channel in range(n_channels)]
+        norm = math.sqrt(sum(value * value for value in weighted))
+        matrix.append([value / norm for value in weighted])
+    return matrix
 
 
 def apply_matrix(ambi: list[float], matrix: list[list[float]]) -> list[float]:
@@ -115,7 +159,19 @@ def apply_matrix(ambi: list[float], matrix: list[list[float]]) -> list[float]:
 
     Energy equality must hold to within ``1e-9``.
     """
-    raise NotImplementedError("apply_matrix is not implemented")
+    raw = [
+        sum(entry * coefficient for entry, coefficient in zip(row, ambi))
+        for row in matrix
+    ]
+
+    input_energy = sum(value * value for value in ambi)
+    output_energy = sum(value * value for value in raw)
+    if input_energy <= 0.0 or output_energy <= 0.0:
+        # A silent frame stays silent; nothing to rescale.
+        return raw
+
+    gain = math.sqrt(input_energy / output_energy)
+    return [value * gain for value in raw]
 
 
 def rotate(ambi: list[float], azimuth: float, elevation: float) -> list[float]:
@@ -131,7 +187,31 @@ def rotate(ambi: list[float], azimuth: float, elevation: float) -> list[float]:
     new list.  A full ``2*pi`` rotation is the identity, and first-order energy
     is conserved, to within ``1e-9``.
     """
-    raise NotImplementedError("rotate is not implemented")
+    result = list(ambi)
+    if len(result) == 1:
+        # W-only field: the omnidirectional component is rotation invariant.
+        return result
+
+    # ACN order is [W, Y, Z, X]; unpack the Cartesian direction components.
+    w, y, z, x = result
+    cos_az = math.cos(azimuth)
+    sin_az = math.sin(azimuth)
+
+    # Yaw about +Z (counter-clockwise from +X toward +Y).
+    yawed_x = cos_az * x - sin_az * y
+    yawed_y = sin_az * x + cos_az * y
+    yawed_z = z
+
+    cos_el = math.cos(elevation)
+    sin_el = math.sin(elevation)
+
+    # Pitch about +Y: positive elevation moves +X toward +Z.
+    pitched_x = cos_el * yawed_x + sin_el * yawed_z
+    pitched_y = yawed_y
+    pitched_z = -sin_el * yawed_x + cos_el * yawed_z
+
+    # W is never modulated by a rotation.
+    return [w, pitched_y, pitched_z, pitched_x]
 
 
 def energy_ratio(ambi: list[float]) -> float:
@@ -147,7 +227,12 @@ def energy_ratio(ambi: list[float]) -> float:
     for silence it is ``0.0``.  The result is always in ``[0, 1]`` and must be
     accurate to ``1e-9``.
     """
-    raise NotImplementedError("energy_ratio is not implemented")
+    w_energy = ambi[0] * ambi[0]
+    first_order_energy = sum(value * value for value in ambi[1:]) / 3.0
+    total = w_energy + first_order_energy
+    if total <= 0.0:
+        return 0.0
+    return w_energy / total
 
 
 def validate_basis(basis: list[list[float]], order: int) -> list[str]:
@@ -163,7 +248,48 @@ def validate_basis(basis: list[list[float]], order: int) -> list[str]:
     with correlated Y and X channels must be reported as non-orthogonal.
     Malformed input is reported, not raised.  Tolerance is ``1e-9``.
     """
-    raise NotImplementedError("validate_basis is not implemented")
+    errors: list[str] = []
+    if order not in (0, 1):
+        errors.append(f"order must be 0 or 1, got {order!r}")
+        return errors
+
+    n_channels = (order + 1) ** 2
+    if not basis:
+        errors.append("basis must contain at least one sample")
+        return errors
+
+    sample_count = len(basis)
+    for index, sample in enumerate(basis):
+        if len(sample) != n_channels:
+            errors.append(
+                f"sample {index} has {len(sample)} channels, expected {n_channels}"
+            )
+    if errors:
+        return errors
+
+    # Mean Gram matrix over the uniform sample set.  N3D harmonics give the
+    # identity: unit mean square per channel and zero cross-channel product.
+    for first in range(n_channels):
+        mean_square = (
+            sum(sample[first] * sample[first] for sample in basis) / sample_count
+        )
+        if abs(mean_square - 1.0) > _TOL:
+            errors.append(
+                f"channel {first} is not normalized: mean square {mean_square!r}"
+            )
+        for second in range(first + 1, n_channels):
+            mean_product = (
+                sum(
+                    sample[first] * sample[second] for sample in basis
+                )
+                / sample_count
+            )
+            if abs(mean_product) > _TOL:
+                errors.append(
+                    f"channels {first} and {second} are not orthogonal: "
+                    f"mean product {mean_product!r}"
+                )
+    return errors
 
 
 def decode_batch(frames: list[list[float]], config: dict) -> dict:
@@ -183,4 +309,28 @@ def decode_batch(frames: list[list[float]], config: dict) -> dict:
     ``"energies"`` holds the total decoded energy of each frame.  Inputs must
     not be mutated.  Results must agree to within ``1e-9``.
     """
-    raise NotImplementedError("decode_batch is not implemented")
+    layout = config["layout"]
+    order = config.get("order", 1)
+    rotation = config.get("rotation")
+
+    matrix = decode_matrix(len(layout), layout, order)
+
+    signals: list[list[float]] = []
+    energies: list[float] = []
+    for frame in frames:
+        # Every frame starts from its own untouched coefficients; the rotation
+        # produces a fresh list and is never carried across frames.
+        current = list(frame)
+        if rotation is not None:
+            current = rotate(current, rotation[0], rotation[1])
+        decoded = apply_matrix(current, matrix)
+        signals.append(decoded)
+        energies.append(sum(value * value for value in decoded))
+
+    return {
+        "order": order,
+        "layout": layout,
+        "matrix": matrix,
+        "signals": signals,
+        "energies": energies,
+    }
